@@ -162,6 +162,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     LgSwitch& purifier_;
     LgSwitch& internal_thermistor_;
     LgSwitch& auto_dry_;
+    LgSwitch* uv_nano_ = nullptr;  // optional, nullptr if not configured
 
     uint8_t recv_buf_[MsgLen] = {};
     uint32_t recv_buf_len_ = 0;
@@ -428,6 +429,7 @@ public:
                  LgSwitch* purifier,
                  LgSwitch* internal_thermistor,
                  LgSwitch* auto_dry,
+                 LgSwitch* uv_nano,
                  bool fahrenheit, bool is_slave_controller)
       : rx_pin_(*rx_pin),
         temperature_sensor_(temperature_sensor),
@@ -452,6 +454,7 @@ public:
         purifier_(*purifier),
         internal_thermistor_(*internal_thermistor),
         auto_dry_(*auto_dry),
+        uv_nano_(uv_nano),
         fahrenheit_(fahrenheit),
         slave_(is_slave_controller)
     {
@@ -496,6 +499,11 @@ public:
         auto_dry_.add_on_state_callback([this](bool) {
             pending_type_a_settings_change_ = true;
         });
+        if (uv_nano_) {
+            uv_nano_->add_on_state_callback([this](bool) {
+                pending_status_change_ = true;
+            });
+        }    
     }
 
     float get_setup_priority() const override {
@@ -824,6 +832,14 @@ private:
         }
         send_buf_[6] = (thermistor << 4) | ((uint8_t(target) - 15) & 0xf);
         send_buf_[7] = (last_recv_status_[7] & 0xC0) | uint8_t((temp - 10) * 2);
+        // UV Nano: bit 0x40 in byte 7. Override based on switch state.
+        if (uv_nano_) {
+            if (uv_nano_->state) {
+                send_buf_[7] |= 0x40;
+            } else {
+                send_buf_[7] &= ~0x40;
+            }
+        }
 
         // Bytes 8-10. Initialize bytes 8-9 to 0 to not echo back timer settings set by the AC.
         send_buf_[8] = 0;
@@ -1153,6 +1169,11 @@ default:
         }
 
         purifier_.publish_state(buffer[2] & 0x4);
+
+        // UV Nano: bit 0x40 in byte 7 = user preference enabled
+        if (uv_nano_) {
+            uv_nano_->publish_state((buffer[7] & 0x40) != 0);
+        }
 
         bool horiz_swing = buffer[2] & 0x40;
         bool vert_swing = buffer[2] & 0x80;
