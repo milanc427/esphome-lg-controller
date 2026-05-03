@@ -1139,10 +1139,17 @@ private:
             case 4:
                 this->fan_mode = climate::CLIMATE_FAN_QUIET;
                 break;
-            default:
-                ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
-                *had_error = true;
-                return;
+            case 5:
+case 6:
+case 7:
+    // Fan mode 5-7: usually Jet/Rapid cooling sequence on the AC.
+    // Keep the previously known fan mode instead of erroring out.
+    ESP_LOGD(TAG, "received fan mode %u from AC (Jet/Rapid mode), keeping previous fan mode", fan_val);
+    break;
+default:
+    ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
+    *had_error = true;
+    return;
         }
 
         purifier_.publish_state(buffer[2] & 0x4);
