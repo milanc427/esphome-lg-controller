@@ -205,6 +205,10 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     optional<uint32_t> sleep_timer_target_millis_{};
     bool active_reservation_ = false;
     bool ignore_sleep_timer_callback_ = false;
+    // Set while publishing switch states received from the AC, so that these don't count as
+    // pending changes. Else we'd ignore further AC updates (like turning off with the remote) and
+    // then send our stale state back to the AC.
+    bool ignore_switch_callbacks_ = false;
 
     uint32_t NVS_STORAGE_VERSION = 2843654U; // Change version if the NVSStorage struct changes
     struct NVSStorage {
@@ -491,13 +495,17 @@ public:
         });
 
         purifier_.add_on_state_callback([this](bool) {
-            pending_status_change_ = true;
+            if (!ignore_switch_callbacks_) {
+                pending_status_change_ = true;
+            }
         });
         internal_thermistor_.add_on_state_callback([this](bool) {
             pending_status_change_ = true;
         });
         auto_dry_.add_on_state_callback([this](bool) {
-            pending_type_a_settings_change_ = true;
+            if (!ignore_switch_callbacks_) {
+                pending_type_a_settings_change_ = true;
+            }
         });
     }
 
@@ -1178,7 +1186,9 @@ private:
                 return;
         }
 
+        ignore_switch_callbacks_ = true;
         purifier_.publish_state(buffer[2] & 0x4);
+        ignore_switch_callbacks_ = false;
 
         bool horiz_swing = buffer[2] & 0x40;
         bool vert_swing = buffer[2] & 0x80;
@@ -1294,7 +1304,9 @@ private:
             ESP_LOGE(TAG, "Unexpected vane 4 position: %u", vane4);
         }
 
+        ignore_switch_callbacks_ = true;
         auto_dry_.publish_state(buffer[11] & 0x8);
+        ignore_switch_callbacks_ = false;
 
         if (sender != MessageSender::Slave) {
             // Handle fan speed 0 (slow) change
@@ -1364,29 +1376,14 @@ private:
         static_assert(sizeof(PipeTempTable) == 256);
         static_assert(PipeTempTable[UINT8_MAX] == INT8_MIN);
 
-        int8_t pipe_temp_in = PipeTempTable[buffer[3]];
-        if (pipe_temp_in == INT8_MIN) {
-            pipe_temp_in_.set_internal(true);
-        } else {
-            pipe_temp_in_.set_internal(false);
-            pipe_temp_in_.publish_state(pipe_temp_in);
-        }
-
-        int8_t pipe_temp_out = PipeTempTable[buffer[4]];
-        if (pipe_temp_out == INT8_MIN) {
-            pipe_temp_out_.set_internal(true);
-        } else {
-            pipe_temp_out_.set_internal(false);
-            pipe_temp_out_.publish_state(pipe_temp_out);
-        }
-
-        int8_t pipe_temp_mid = PipeTempTable[buffer[5]];
-        if (pipe_temp_mid == INT8_MIN) {
-            pipe_temp_mid_.set_internal(true);
-        } else {
-            pipe_temp_mid_.set_internal(false);
-            pipe_temp_mid_.publish_state(pipe_temp_mid);
-        }
+        // Publish NAN (unknown) for invalid values. Calling set_internal() after setup is not
+        // supported by ESPHome.
+        auto publish_pipe_temp = [](sensor::Sensor& sensor, int8_t value) {
+            sensor.publish_state(value == INT8_MIN ? NAN : float(value));
+        };
+        publish_pipe_temp(pipe_temp_in_, PipeTempTable[buffer[3]]);
+        publish_pipe_temp(pipe_temp_out_, PipeTempTable[buffer[4]]);
+        publish_pipe_temp(pipe_temp_mid_, PipeTempTable[buffer[5]]);
     }
 
     void update() {
