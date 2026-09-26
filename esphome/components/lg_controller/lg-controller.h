@@ -10,6 +10,15 @@ namespace esphome::lg_controller {
 static constexpr size_t MIN_TEMP_SETPOINT = 16;
 static constexpr size_t MAX_TEMP_SETPOINT = 30;
 
+// Custom fan modes for the 5-step fan speed (plus Jet/Power). Low, Medium and High are also custom
+// modes so HA shows all speeds in order.
+static const char* const FAN_SPEED_1 = "1 Nízká";
+static const char* const FAN_SPEED_2 = "2 Nízká-střední";
+static const char* const FAN_SPEED_3 = "3 Střední";
+static const char* const FAN_SPEED_4 = "4 Středně-vysoká";
+static const char* const FAN_SPEED_5 = "5 Vysoká";
+static const char* const FAN_JET = "Jet";
+
 class LgSwitch final : public switch_::Switch {
     void write_state(bool value) override {
         publish_state(value);
@@ -162,7 +171,6 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     LgSwitch& purifier_;
     LgSwitch& internal_thermistor_;
     LgSwitch& auto_dry_;
-    LgSwitch* uv_nano_ = nullptr;  // optional, nullptr if not configured
 
     uint8_t recv_buf_[MsgLen] = {};
     uint32_t recv_buf_len_ = 0;
@@ -294,12 +302,12 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         device_modes.insert(climate::CLIMATE_MODE_FAN_ONLY);
         device_modes.insert(climate::CLIMATE_MODE_HEAT_COOL);
         
+        // Fixed fan speeds are custom modes (see FAN_SPEED_*), always offered.
         climate::ClimateFanModeMask fan_modes;
-        fan_modes.insert(climate::CLIMATE_FAN_LOW);
-        fan_modes.insert(climate::CLIMATE_FAN_MEDIUM);
-        fan_modes.insert(climate::CLIMATE_FAN_HIGH);
         fan_modes.insert(climate::CLIMATE_FAN_AUTO);
-        
+        this->set_supported_custom_fan_modes({FAN_SPEED_1, FAN_SPEED_2, FAN_SPEED_3,
+                                              FAN_SPEED_4, FAN_SPEED_5, FAN_JET});
+
         climate::ClimateSwingModeMask swing_modes;
         swing_modes.insert(climate::CLIMATE_SWING_OFF);
         swing_modes.insert(climate::CLIMATE_SWING_BOTH);
@@ -336,12 +344,6 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 override_fan_modes.insert(climate::CLIMATE_FAN_AUTO);
             if (parse_capability(LgCapability::FAN_SLOW))
                 override_fan_modes.insert(climate::CLIMATE_FAN_QUIET);
-            if (parse_capability(LgCapability::FAN_LOW))
-                override_fan_modes.insert(climate::CLIMATE_FAN_LOW);
-            if (parse_capability(LgCapability::FAN_MEDIUM))
-                override_fan_modes.insert(climate::CLIMATE_FAN_MEDIUM);
-            if (parse_capability(LgCapability::FAN_HIGH))
-                override_fan_modes.insert(climate::CLIMATE_FAN_HIGH);
             supported_traits_.set_supported_fan_modes(override_fan_modes);
 
             climate::ClimateSwingModeMask override_swing_modes;
@@ -429,7 +431,6 @@ public:
                  LgSwitch* purifier,
                  LgSwitch* internal_thermistor,
                  LgSwitch* auto_dry,
-                 LgSwitch* uv_nano,
                  bool fahrenheit, bool is_slave_controller)
       : rx_pin_(*rx_pin),
         temperature_sensor_(temperature_sensor),
@@ -454,7 +455,6 @@ public:
         purifier_(*purifier),
         internal_thermistor_(*internal_thermistor),
         auto_dry_(*auto_dry),
-        uv_nano_(uv_nano),
         fahrenheit_(fahrenheit),
         slave_(is_slave_controller)
     {
@@ -499,11 +499,6 @@ public:
         auto_dry_.add_on_state_callback([this](bool) {
             pending_type_a_settings_change_ = true;
         });
-        if (uv_nano_) {
-            uv_nano_->add_on_state_callback([this](bool) {
-                pending_status_change_ = true;
-            });
-        }    
     }
 
     float get_setup_priority() const override {
@@ -515,13 +510,18 @@ public:
         ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
         pref.load(&nvs_storage_);
 
+        // Configure climate traits and entities based on the capabilities message (if available).
+        // This must happen before restoring state because custom fan modes are restored by index
+        // into the supported custom fan modes.
+        configure_capabilities();
+
         auto restore = this->restore_state_();
         if (restore.has_value()) {
             restore->apply(this);
         } else {
             this->mode = climate::CLIMATE_MODE_OFF;
             this->target_temperature = 20;
-            this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
+            this->set_custom_fan_mode_(FAN_SPEED_3);
             this->swing_mode = climate::CLIMATE_SWING_OFF;
             this->publish_state();
         }
@@ -529,9 +529,6 @@ public:
         internal_thermistor_.restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
 
         sleep_timer_.publish_state(0);
-
-        // Configure climate traits and entities based on the capabilities message (if available)
-        configure_capabilities();
 
         while (UARTDevice::available() > 0) {
             uint8_t b;
@@ -554,7 +551,9 @@ public:
             this->target_temperature = *call.get_target_temperature();
         }
         if (call.get_fan_mode().has_value()) {
-            this->fan_mode = *call.get_fan_mode();
+            this->set_fan_mode_(*call.get_fan_mode());
+        } else if (call.has_custom_fan_mode()) {
+            this->set_custom_fan_mode_(call.get_custom_fan_mode());
         }
         if (call.get_swing_mode().has_value()) {
             set_swing_mode(*call.get_swing_mode());
@@ -735,8 +734,25 @@ private:
                 break;
         }
         
-        // Fix: Check if fan_mode has a value before dereferencing
-        if (this->fan_mode.has_value()) {
+        if (this->has_custom_fan_mode()) {
+            StringRef custom = this->get_custom_fan_mode();
+            if (custom == FAN_SPEED_1) {
+                b |= 0 << 5;
+            } else if (custom == FAN_SPEED_2) {
+                b |= 5 << 5;
+            } else if (custom == FAN_SPEED_3) {
+                b |= 1 << 5;
+            } else if (custom == FAN_SPEED_4) {
+                b |= 6 << 5;
+            } else if (custom == FAN_SPEED_5) {
+                b |= 2 << 5;
+            } else if (custom == FAN_JET) {
+                b |= 7 << 5;
+            } else {
+                ESP_LOGE(TAG, "unknown custom fan mode %s, using Medium", custom.c_str());
+                b |= 1 << 5;
+            }
+        } else if (this->fan_mode.has_value()) {
             switch (this->fan_mode.value()) {
                 case climate::CLIMATE_FAN_LOW:
                     b |= 0 << 5;
@@ -832,14 +848,6 @@ private:
         }
         send_buf_[6] = (thermistor << 4) | ((uint8_t(target) - 15) & 0xf);
         send_buf_[7] = (last_recv_status_[7] & 0xC0) | uint8_t((temp - 10) * 2);
-        // UV Nano: bit 0x40 in byte 7. Override based on switch state.
-        if (uv_nano_) {
-            if (uv_nano_->state) {
-                send_buf_[7] |= 0x40;
-            } else {
-                send_buf_[7] &= ~0x40;
-            }
-        }
 
         // Bytes 8-10. Initialize bytes 8-9 to 0 to not echo back timer settings set by the AC.
         send_buf_[8] = 0;
@@ -1141,39 +1149,36 @@ private:
         uint8_t fan_val = b >> 5;
         switch (fan_val) {
             case 0:
-                this->fan_mode = climate::CLIMATE_FAN_LOW;
-                break;
-            case 1:
-                this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
-                break;
-            case 2:
-                this->fan_mode = climate::CLIMATE_FAN_HIGH;
-                break;
-            case 3:
-                this->fan_mode = climate::CLIMATE_FAN_AUTO;
-                break;
-            case 4:
-                this->fan_mode = climate::CLIMATE_FAN_QUIET;
+                this->set_custom_fan_mode_(FAN_SPEED_1);
                 break;
             case 5:
-case 6:
-case 7:
-    // Fan mode 5-7: usually Jet/Rapid cooling sequence on the AC.
-    // Keep the previously known fan mode instead of erroring out.
-    ESP_LOGD(TAG, "received fan mode %u from AC (Jet/Rapid mode), keeping previous fan mode", fan_val);
-    break;
-default:
-    ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
-    *had_error = true;
-    return;
+                this->set_custom_fan_mode_(FAN_SPEED_2);
+                break;
+            case 1:
+                this->set_custom_fan_mode_(FAN_SPEED_3);
+                break;
+            case 6:
+                this->set_custom_fan_mode_(FAN_SPEED_4);
+                break;
+            case 2:
+                this->set_custom_fan_mode_(FAN_SPEED_5);
+                break;
+            case 7:
+                this->set_custom_fan_mode_(FAN_JET);
+                break;
+            case 3:
+                this->set_fan_mode_(climate::CLIMATE_FAN_AUTO);
+                break;
+            case 4:
+                this->set_fan_mode_(climate::CLIMATE_FAN_QUIET);
+                break;
+            default:
+                ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
+                *had_error = true;
+                return;
         }
 
         purifier_.publish_state(buffer[2] & 0x4);
-
-        // UV Nano: bit 0x40 in byte 7 = user preference enabled
-        if (uv_nano_) {
-            uv_nano_->publish_state((buffer[7] & 0x40) != 0);
-        }
 
         bool horiz_swing = buffer[2] & 0x40;
         bool vert_swing = buffer[2] & 0x80;
